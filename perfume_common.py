@@ -28,6 +28,7 @@ from estimater import *  # noqa: E402  (needs FP_DIR on sys.path first)
 # Base-centered, metric CAD written by prepare_mesh.py
 DEFAULT_MESH = os.path.join(PROJ_DIR, 'model', 'perfume_bottle_base.obj')
 DEFAULT_DATASET = os.path.join(PROJ_DIR, 'data', 'perfume')
+DEFAULT_MASK = os.path.join(DEFAULT_DATASET, 'masks', '000000.png')
 
 
 def load_bottle_mesh(mesh_file=DEFAULT_MESH):

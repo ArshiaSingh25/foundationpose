@@ -7,19 +7,21 @@
 
 """Live 6D pose of the perfume bottle from a RealSense D405.
 
-Workflow:
-  1. The colour stream opens in a window. Drag a rectangle around the bottle
-     and press Enter; GrabCut then refines that box into a mask.
-  2. FoundationPose registers the CAD on that frame (full pose search).
-  3. Every later frame is tracked from the previous pose (fast).
-  4. The box, the axis triad and the live pose are drawn, and each pose is
-     appended to a JSONL file.
+Registration is the central operation. The object mask is the known
+segmentation (default: data/perfume/masks/000000.png), not GrabCut:
 
-Keys: r = re-register on the current frame, s = save a snapshot, q/ESC = quit.
+  CAD + RGB + Depth + K + known mask  ->  register()  ->  T_cam_bottle
 
-Depth is aligned to the colour stream, so the mask taken from the colour
-image lines up with the depth pixels FoundationPose consumes. Intrinsics
-are read from the colour stream to match that alignment.
+On start the first RGB-D frame is registered with that mask. Press R to
+register again on the current frame (same mask, new RGB-D) after you move
+the bottle. After an accepted registration, later frames use track_one(),
+each scored with score_pose(). A bad track rolls back to the last good
+pose; several consecutive failures trigger automatic re-registration.
+
+Keys: r = register / re-register, s = snapshot, q/ESC = quit.
+
+Depth is aligned to the colour stream. Intrinsics come from the colour
+stream to match that alignment.
 """
 
 import argparse
@@ -30,12 +32,14 @@ import time
 import cv2
 import numpy as np
 import pyrealsense2 as rs
+import torch
 import trimesh
 
-from perfume_common import (DEFAULT_MESH, PROJ_DIR, build_estimator,
-                            draw_posed_3d_box, draw_xyz_axis, format_pose,
-                            score_pose,
-                            load_bottle_mesh, set_logging_format, set_seed)
+from auto_init import STATE_PATH, save_state, try_cached_init
+from perfume_common import (DEFAULT_MASK, DEFAULT_MESH, PROJ_DIR,
+                            build_estimator, draw_posed_3d_box, draw_xyz_axis,
+                            format_pose, score_pose, load_bottle_mesh,
+                            set_logging_format, set_seed)
 
 WINDOW = 'perfume live'
 
@@ -45,6 +49,7 @@ WINDOW = 'perfume live'
 # IoU 0.40. 30% / 0.25 sits in that gap with room on both sides.
 MIN_FIT = 0.30
 MIN_IOU = 0.25
+LOST_FRAMES = 5
 
 
 def start_pipeline(width, height, fps, warmup=15):
@@ -93,7 +98,7 @@ def grab_frames(pipeline, align, depth_scale):
   return rgb, depth, K
 
 
-def _depth_seeds(depth, x0, y0, x1, y1):
+def draw_overlay(vis, pose, bbox, K, line, extra=""):
   """Depth ranges that separate the object from the background in a box.
 
   Returns (near, seed_tol, bg_cut) in metres, or None if depth is unusable.
@@ -300,6 +305,75 @@ def draw_overlay(vis, pose, bbox, K, line, extra=""):
   return vis
 
 
+def load_known_mask(path, hw):
+  """Load a current-frame segmentation (any image; >127 is foreground)."""
+  img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+  if img is None:
+    return None, f'could not read mask {path}'
+  H, W = hw
+  if img.shape[0] != H or img.shape[1] != W:
+    img = cv2.resize(img, (W, H), interpolation=cv2.INTER_NEAREST)
+  mask = img > 127
+  area = int(mask.sum())
+  if area < 400:
+    return None, f'known mask too small ({area} px)'
+  return mask, f'known mask {area} px from {path}'
+
+
+def restore_tracker_pose(est, pose):
+  """Point FoundationPose's tracker at a camera-frame pose (rollback)."""
+  tf = est.get_tf_to_centered_mesh().detach().cpu().numpy().astype(np.float32)
+  centered = np.asarray(pose, dtype=np.float32).reshape(4, 4) @ np.linalg.inv(tf)
+  est.pose_last = torch.as_tensor(centered, device='cuda', dtype=torch.float)
+
+
+def register_current(est, K, rgb, depth, mask, mesh, iteration):
+  """CAD + RGB-D + K + current-frame mask -> pose, gated by score_pose.
+
+  Returns (pose, fit, iou, dt_s). pose is None when the quality gate fails.
+  """
+  t0 = time.time()
+  pose = est.register(K=K, rgb=rgb, depth=depth, ob_mask=mask,
+                      iteration=iteration)
+  dt = time.time() - t0
+  _, fit, iou = score_pose(est, pose, K, depth, mask=mask, mesh=mesh)
+  ok = fit >= MIN_FIT and (iou is None or iou >= MIN_IOU)
+  print(f'registered in {dt:.2f} s  |  mask IoU '
+        f'{iou if iou is not None else float("nan"):.2f}, '
+        f'depth agreement {fit * 100:.0f}%'
+        f'  {"ACCEPT" if ok else "REJECT"}')
+  print(format_pose(pose))
+  if not ok:
+    print('  pose does not fit this frame. Press b for a tighter box, or r '
+          'after moving the bottle into a clearer view.')
+    return None, fit, iou, dt
+  print('  pose looks consistent with the frame.\n')
+  return np.asarray(pose).reshape(4, 4), fit, iou, dt
+
+
+def current_frame_mask(rgb, depth, K, last_mask=None, mask_path=None,
+                       prefer_file=False):
+  """Build a bottle mask for *this* frame (known file and/or last mask)."""
+  tried = []
+  if prefer_file and mask_path:
+    tried.append('file')
+  if last_mask is not None and last_mask.shape == depth.shape:
+    tried.append('last')
+  if mask_path and 'file' not in tried:
+    tried.append('file')
+  last_msg = 'no current-frame mask (press b to draw a box)'
+  for src in tried:
+    if src == 'file':
+      m, msg = load_known_mask(mask_path, depth.shape[:2])
+    else:
+      m, msg = mask_from_box(rgb, depth, None, init_mask=last_mask, K=K)
+    if m is not None:
+      return m, msg
+    last_msg = msg
+    print(msg)
+  return None, last_msg
+
+
 def main():
   p = argparse.ArgumentParser()
   p.add_argument('--mesh_file', type=str, default=DEFAULT_MESH)
@@ -310,9 +384,20 @@ def main():
                  help='frames to discard after start, for auto-exposure')
   p.add_argument('--est_refine_iter', type=int, default=5)
   p.add_argument('--track_refine_iter', type=int, default=2)
+  p.add_argument('--mask', type=str, default='',
+                 help='known current-frame bottle mask (png/jpg, >127 = object)')
+  p.add_argument('--init_state', type=str, default=STATE_PATH,
+                 help='cached last-good registration (pose+mask)')
+  p.add_argument('--no_auto_init', action='store_true',
+                 help='do not try init_state.npz on startup')
+  p.add_argument('--register_only', action='store_true',
+                 help='phase-1 test: hold each accepted register(); no tracking')
+  p.add_argument('--lost_frames', type=int, default=LOST_FRAMES,
+                 help='consecutive bad tracks before auto re-register')
   p.add_argument('--out', type=str, default=os.path.join(PROJ_DIR, 'live_poses.jsonl'))
   p.add_argument('--snap_dir', type=str, default=os.path.join(PROJ_DIR, 'live_snaps'))
   args = p.parse_args()
+  mask_path = args.mask or None
 
   set_logging_format()
   set_seed(0)
@@ -330,19 +415,26 @@ def main():
 
   os.makedirs(args.snap_dir, exist_ok=True)
   pose = None
+  last_good_pose = None
   mask = None
   frame_id = 0
   n_track = 0
+  n_reg = 0
   fps_ema = 0.0
   selecting = False
   bad_frames = 0
   last_inlier = 1.0
   last = None  # last rendered frame, reused as the selectROI background
+  mode = 'idle'  # idle | register | track
 
-  print('\nlive feed running. press b to draw a box around the bottle, '
-        'then Enter.')
-  print('keys: b = draw box (register), r = re-register, s = snapshot, '
-        'q = quit\n')
+  print('\nlive feed running.')
+  print('  b / Space  draw a box -> GrabCut mask -> REGISTER')
+  print('  r          re-register on the current frame (current mask)')
+  print('  s          snapshot    q / ESC  quit')
+  if args.register_only:
+    print('  --register_only: tracking is off; move the bottle and press r\n')
+  else:
+    print('  after a good register(), later frames TRACK until quality drops\n')
 
   def draw_hint(img, lines):
     for j, text in enumerate(lines):
@@ -352,42 +444,83 @@ def main():
                   (0, 255, 255), 1, cv2.LINE_AA)
     return img
 
-  def do_select(rgb, depth, K):
-    """Block for a rectangle on the current frame, then register.
+  def accept_pose(new_pose, new_mask, how, K_now):
+    nonlocal pose, last_good_pose, mask, n_track, bad_frames, last_inlier, mode, n_reg
+    pose = np.asarray(new_pose).reshape(4, 4)
+    last_good_pose = pose.copy()
+    mask = new_mask
+    n_reg += 1
+    n_track = 0
+    bad_frames = 0
+    last_inlier = 1.0
+    mode = 'register' if args.register_only else 'track'
+    save_state(args.init_state, pose, mask, K_now, note=how)
+    print(f'accepted ({how}). '
+          f'{"hold pose; press r to register again" if args.register_only else "tracking"}.'
+          f'\n')
+    return pose, mask
 
-    Returns (pose, mask), or (None, None) if cancelled or the mask is bad.
-    """
+  def try_register(rgb, depth, K_now, src_mask, how):
+    """Run register() + score_pose on a current-frame mask."""
+    if src_mask is None:
+      return None, None
+    print(f'registering ({how}) ...')
+    new_pose, fit, iou, _ = register_current(
+      est, K_now, rgb, depth, src_mask, mesh, args.est_refine_iter)
+    if new_pose is None:
+      return None, None
+    with open(args.out, 'a') as f:
+      f.write(json.dumps({
+        'frame': frame_id, 'event': 'register', 'how': how,
+        'fit': float(fit), 'iou': None if iou is None else float(iou),
+        'pose': new_pose.reshape(4, 4).tolist(),
+      }) + '\n')
+    return accept_pose(new_pose, src_mask, how, K_now)
+
+  def do_select(rgb, depth, K):
+    """Block for a rectangle on the current frame, then register."""
     rect = cv2.selectROI(WINDOW, last, showCrosshair=True, fromCenter=False)
     if rect == (0, 0, 0, 0):
       print('no box selected (Esc), still live')
       return None, None
-    mask, msg = mask_from_box(rgb, depth, rect, K=K)
-    if mask is None:
+    src_mask, msg = mask_from_box(rgb, depth, rect, K=K)
+    if src_mask is None:
       print(msg)
       return None, None
-    print(f'registering ({msg}) ...')
-    t0 = time.time()
-    pose = est.register(K=K, rgb=rgb, depth=depth, ob_mask=mask,
-                        iteration=args.est_refine_iter)
-    print(f'registered in {time.time() - t0:.2f} s ->\n{format_pose(pose)}')
+    return try_register(rgb, depth, K, src_mask, msg)
 
-    # Do not start tracking a pose that does not actually explain the frame.
-    # Without this the tracker happily flies off the object and you only
-    # notice when the box is somewhere else entirely.
-    #
-    # Thresholds are calibrated on the 180 recorded frames scored with their
-    # offline poses: known-good fits are min 43.7% / median 58.9%, while a
-    # deliberately wrong pose scores 0%. 30% therefore sits in a wide empty
-    # gap, and a 50% gate would have rejected 21 of the 180 good frames.
-    _, inlier, iou = score_pose(est, pose, K, depth, mask=mask, mesh=mesh)
-    print(f'check: mask IoU {iou:.2f}, depth agreement {inlier * 100:.0f}%')
-    if inlier < MIN_FIT or (iou is not None and iou < MIN_IOU):
-      print('  WARNING: that pose does not fit the frame well. It is probably '
-            'wrong.\n  Press b to draw a tighter box on the bottle, making '
-            'sure it fills the box.')
+  def do_reregister(rgb, depth, K, prefer_file=False):
+    src_mask, msg = current_frame_mask(
+      rgb, depth, K, last_mask=mask, mask_path=mask_path,
+      prefer_file=prefer_file)
+    if src_mask is None:
+      print(msg)
       return None, None
-    print('  pose looks consistent with the frame.\n')
-    return pose, mask
+    return try_register(rgb, depth, K, src_mask, msg)
+
+  def overlay_pose(vis, pose, extra):
+    center_pose = np.asarray(pose) @ np.linalg.inv(to_origin)
+    vis = draw_overlay(vis, center_pose, bbox, K, format_pose(pose), extra)
+    if mask is not None and n_track == 0:
+      vis[mask] = (0.75 * vis[mask] + 0.25 * np.array([0, 255, 255])).astype(np.uint8)
+    return vis
+
+  # First RGB-D: optional cache / known-mask registration before the loop.
+  rgb0, depth0, K0 = grab_frames(pipeline, align, depth_scale)
+  K0 = np.asarray(K0, dtype=np.float64)
+  if not args.no_auto_init:
+    cached_pose, cached_mask, how = try_cached_init(
+      est, K0, rgb0, depth0, mesh, path=args.init_state, min_fit=MIN_FIT,
+      mask_fn=mask_from_box, verbose=True)
+    if cached_pose is not None:
+      accept_pose(cached_pose, cached_mask, f'auto-init {how}', K0)
+      restore_tracker_pose(est, pose)
+  if pose is None and mask_path:
+    src_mask, msg = load_known_mask(mask_path, depth0.shape[:2])
+    if src_mask is None:
+      print(msg)
+    else:
+      try_register(rgb0, depth0, K0, src_mask, msg)
 
   while True:
     rgb, depth, K = grab_frames(pipeline, align, depth_scale)
@@ -405,45 +538,65 @@ def main():
 
     if pose is None:
       vis = draw_hint(vis, [
-        f'live  |  frame {frame_id}',
-        'press b to draw a box around the bottle, then Enter',
+        f'idle  |  frame {frame_id}  |  REGISTER is the next step',
+        'b = box+GrabCut mask+register   r = re-register if a mask exists',
         f'valid depth: {100.0 * (depth > 0).mean():.0f}% of frame',
       ])
+    elif args.register_only or mode == 'register':
+      _, last_inlier, _ = score_pose(est, pose, K, depth, mesh=mesh)
+      extra = (f'register {n_reg}  |  fit {last_inlier*100:3.0f}%  |  '
+               f'move bottle, press r to REGISTER again')
+      vis = overlay_pose(vis, pose, extra)
     else:
       t0 = time.time()
-      pose = est.track_one(rgb=rgb, depth=depth, K=K,
-                           iteration=args.track_refine_iter)
+      candidate = est.track_one(rgb=rgb, depth=depth, K=K,
+                                iteration=args.track_refine_iter)
       dt = time.time() - t0
       n_track += 1
       fps_ema = 1.0 / dt if fps_ema == 0 else 0.9 * fps_ema + 0.1 / dt
-      with open(args.out, 'a') as f:
-        f.write(json.dumps({'frame': frame_id, 'track': n_track,
-                            'pose': np.asarray(pose).reshape(4, 4).tolist()}) + '\n')
+      _, inlier, _ = score_pose(est, candidate, K, depth, mesh=mesh)
+      recovered = False
 
-      # Show how well the pose still explains the frame, so a tracker that is
-      # sliding off the object is obvious instead of silently drifting.
-      if n_track % 5 == 1 or bad_frames:
-        _, inlier, _ = score_pose(est, pose, K, depth, mesh=mesh)
-        if inlier < MIN_FIT:
-          bad_frames += 1
-          if bad_frames == 5:
-            print(f'\nWARNING: the pose no longer fits the frame (depth '
-                  f'agreement below {MIN_FIT * 100:.0f}%). The tracker has '
-                  f'probably lost the object.\n  Press r, then b to '
-                  f're-register on the bottle.')
-        else:
-          bad_frames = 0
+      if inlier >= MIN_FIT:
+        pose = np.asarray(candidate).reshape(4, 4)
+        last_good_pose = pose.copy()
+        bad_frames = 0
       else:
-        inlier = last_inlier
+        bad_frames += 1
+        if last_good_pose is not None:
+          pose = last_good_pose.copy()
+          restore_tracker_pose(est, pose)
+        if bad_frames == 1 or bad_frames == args.lost_frames:
+          print(f'track fit {inlier*100:.0f}% (need {MIN_FIT*100:.0f}%) — '
+                f'rolled back to last good pose'
+                f'{"" if bad_frames < args.lost_frames else "; re-registering"}')
+        if bad_frames >= args.lost_frames:
+          new_pose, _ = do_reregister(rgb, depth, K)
+          recovered = new_pose is not None
+          if not recovered:
+            pose = None
+            last_good_pose = None
+            mode = 'idle'
+            print('re-register failed. press b to draw a new box.\n')
 
-      center_pose = np.asarray(pose) @ np.linalg.inv(to_origin)
-      last_inlier = inlier
-      flag = '  LOST' if inlier < MIN_FIT else ''
-      extra = (f'track {n_track}  |  {fps_ema:.1f} Hz  |  fit {inlier*100:3.0f}%'
-               f'{flag}  |  r=re-register s=snap q=quit')
-      vis = draw_overlay(vis, center_pose, bbox, K, format_pose(pose), extra)
-      if mask is not None and n_track == 0:
-        vis[mask] = (0.75 * vis[mask] + 0.25 * np.array([0, 255, 255])).astype(np.uint8)
+      if pose is None:
+        vis = draw_hint(vis, [
+          f'idle  |  frame {frame_id}  |  tracker lost, REGISTER again',
+          'b = box+GrabCut mask+register   r = re-register if a mask exists',
+        ])
+      else:
+        if not recovered:
+          with open(args.out, 'a') as f:
+            f.write(json.dumps({
+              'frame': frame_id, 'event': 'track', 'track': n_track,
+              'fit': float(inlier), 'accepted': bool(inlier >= MIN_FIT),
+              'pose': np.asarray(pose).reshape(4, 4).tolist(),
+            }) + '\n')
+        last_inlier = 1.0 if recovered else inlier
+        flag = '' if recovered or inlier >= MIN_FIT else '  LOST'
+        extra = (f'track {n_track}  |  {fps_ema:.1f} Hz  |  fit {last_inlier*100:3.0f}%'
+                 f'{flag}  |  r=REGISTER s=snap q=quit')
+        vis = overlay_pose(vis, pose, extra)
 
     last = vis[..., ::-1].copy()
     cv2.imshow(WINDOW, last)
@@ -453,15 +606,12 @@ def main():
       break
     if key in (ord('b'), ord(' ')):
       selecting = True
-      pose, mask = do_select(rgb, depth, K)
-      if pose is not None:
-        n_track = 0
-        bad_frames = 0
-        last_inlier = 1.0
-        print('tracking live now. r = re-register.\n')
+      do_select(rgb, depth, K)
     if key == ord('r'):
-      pose = None
-      print('released. press b to draw a new box.\n')
+      selecting = False
+      new_pose, _ = do_reregister(rgb, depth, K)
+      if new_pose is None and mask is None:
+        print('no mask yet. press b to draw a box, then Enter.\n')
     if key == ord('s') and pose is not None:
       fn = os.path.join(args.snap_dir, f'frame{frame_id:06d}.png')
       cv2.imwrite(fn, vis[:, :, ::-1])
@@ -470,8 +620,8 @@ def main():
 
   pipeline.stop()
   cv2.destroyAllWindows()
-  print(f'\nstopped after {frame_id} frames, {n_track} tracked. '
-        f'poses appended to {args.out}')
+  print(f'\nstopped after {frame_id} frames, {n_reg} registrations, '
+        f'{n_track} tracked. poses appended to {args.out}')
 
 
 if __name__ == '__main__':
